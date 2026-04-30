@@ -16,10 +16,13 @@ from stockbot.execution.orders import (
     capital_fraction_for_slot,
     capital_fractions_for_chosen_slots,
 )
+from stockbot.features.premarket import neutral_symbol_row, neutral_spy_row
 from stockbot.features.sentiment import sentiment_features_from_llm
 from stockbot.features.technical import technical_features
 from stockbot.ingestion.filings import fetch_filings_refs
 from stockbot.ingestion.market import fetch_market_snapshots
+from stockbot.ingestion.premarket import fetch_premarket_for_watchlist
+from stockbot.ingestion.premarket_wait import wait_until_premarket_decision_et
 from stockbot.ingestion.news import fetch_news
 from stockbot.models import DailyReasoningRecord, IngestionBundle
 from stockbot.risk.engine import RiskEngine, load_daily_trade_count, record_trade_execution
@@ -73,14 +76,60 @@ def run_daily_pipeline(
     market, market_meta = fetch_market_snapshots(symbols, settings, as_of=ingest_as_of)
 
     watchlist_market = {s: market[s] for s in symbols if s in market}
+
+    if settings.enable_premarket_signals:
+        wait_until_premarket_decision_et(trade_date, settings)
+        try:
+            step1 = fetch_premarket_for_watchlist(settings, trade_date, symbols)
+            pm_state = {
+                "disabled_session": False,
+                "trade_date": trade_date.isoformat(),
+                "feed": (settings.alpaca_data_feed or "sip").strip().lower() or "sip",
+                "step1": step1,
+                "symbols": {
+                    s.upper(): neutral_symbol_row(fetch_error="STEP1_INGESTION_ONLY") for s in symbols
+                },
+                "spy": neutral_spy_row(fetch_error="STEP1_INGESTION_ONLY"),
+                "errors": [],
+            }
+            for sym, row in step1.items():
+                st = row.get("status")
+                if st and st != "ok":
+                    pm_state["errors"].append(f"{sym}:{st}:{row.get('reason')}")
+        except Exception as exc:  # noqa: BLE001 — never fail the whole pipeline on pre-market
+            _LOG.exception("[premarket] session fetch failed; disabling for this run only")
+            pm_state = {
+                "disabled_session": True,
+                "trade_date": trade_date.isoformat(),
+                "feed": None,
+                "errors": [f"pipeline_wrap:{exc!r}"],
+                "symbols": {s.upper(): neutral_symbol_row(fetch_error="session_fetch_failed") for s in symbols},
+                "spy": neutral_spy_row(fetch_error="session_fetch_failed"),
+            }
+    else:
+        pm_state = {
+            "disabled_session": True,
+            "trade_date": trade_date.isoformat(),
+            "feed": None,
+            "errors": ["STOCKBOT_ENABLE_PREMARKET_SIGNALS off"],
+            "symbols": {s.upper(): neutral_symbol_row(fetch_error="FEATURE_FLAG_OFF") for s in symbols},
+            "spy": neutral_spy_row(fetch_error="FEATURE_FLAG_OFF"),
+        }
+
     news, news_meta = fetch_news(
         symbols, run_date=ingest_as_of, trade_date=trade_date, settings=settings
     )
     filings = fetch_filings_refs(symbols, as_of=trade_date)
-    bundle = IngestionBundle(run_date=trade_date, market=watchlist_market, news=news, filings=filings)
+    bundle = IngestionBundle(
+        run_date=trade_date,
+        market=watchlist_market,
+        news=news,
+        filings=filings,
+        premarket=pm_state,
+    )
 
     llm_views = llm.analyze_watchlist(symbols, news, filings)
-    decision = strategy.decide(trade_date, bundle, llm_views)
+    decision = strategy.decide(trade_date, bundle, llm_views, settings)
 
     # Baseline for audit; in-loop counter increments after each successful non-dry fill.
     initial_daily_trade_count = load_daily_trade_count(settings.state_dir, trade_date)
@@ -109,19 +158,23 @@ def run_daily_pipeline(
             position_weight = capital_fraction_for_slot(slot, n_picks)
         account = broker.get_account()
         open_syms = broker.list_open_position_symbols()
+        pm_mult = float(getattr(decision, "risk_notional_multiplier", 1.0) or 1.0)
+        effective_weight = float(position_weight) * pm_mult
         verdict = risk_engine.evaluate(
             trade_date,
             cand,
             account,
             daily_trades_executed=daily_trades_executed,
             open_position_symbols=open_syms,
-            notional_fraction=position_weight,
+            notional_fraction=effective_weight,
         )
         risk_evaluations.append(
             {
                 "symbol": cand.symbol,
                 "trade_slot": slot + 1,
                 "position_weight": position_weight,
+                "premarket_notional_multiplier": pm_mult,
+                "effective_notional_fraction": effective_weight,
                 "allowed": verdict.allowed,
                 "block_reasons": list(verdict.block_reasons),
                 "qty": verdict.position_qty,
@@ -139,6 +192,8 @@ def run_daily_pipeline(
                 "symbol": cand.symbol,
                 "trade_slot": slot + 1,
                 "position_weight": position_weight,
+                "premarket_notional_multiplier": pm_mult,
+                "effective_notional_fraction": effective_weight,
                 "success": execution.success,
                 "broker_order_id": execution.broker_order_id,
                 "error": execution.error,
@@ -196,6 +251,8 @@ def run_daily_pipeline(
 
     strategy_payload = {
         "reason_codes": audit_reason_codes,
+        "premarket": bundle.premarket,
+        "risk_notional_multiplier": float(getattr(decision, "risk_notional_multiplier", 1.0) or 1.0),
         "ranked": [
             {
                 "symbol": c.symbol,

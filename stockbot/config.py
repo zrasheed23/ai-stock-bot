@@ -9,6 +9,19 @@ from pathlib import Path
 
 _LOG = logging.getLogger("stockbot.config")
 
+# -----------------------------------------------------------------------------
+# Pre-market MVP-0 — thresholds (tune here without editing strategy math)
+# -----------------------------------------------------------------------------
+# Master switch default; override with env ``STOCKBOT_ENABLE_PREMARKET_SIGNALS=0``.
+ENABLE_PREMARKET_SIGNALS = True
+
+PM_GAP_ATR_HARD_SKIP = 2.5
+PM_GAP_ATR_WARN = 1.0
+PM_RVOL_MIN_ON_GAP = 0.3
+PM_RVOL_STRONG = 2.0
+SPY_GAP_ATR_REDUCE = -1.5
+SPY_GAP_ATR_NO_TRADE = -2.5
+
 # TEMPORARY: remove this block once you trust `.env` + shell loading (beginner debug aid).
 _FINNHUB_ENV = "FINNHUB_API_KEY"
 
@@ -102,6 +115,8 @@ class Settings:
     dry_run: bool
     max_position_fraction: float  # max fraction of equity for one position
     max_daily_trades: int
+    enable_premarket_signals: bool
+    alpaca_data_feed: str  # Alpaca stock bars feed, e.g. ``sip`` or ``iex``
 
     @staticmethod
     def from_env() -> "Settings":
@@ -125,4 +140,9 @@ class Settings:
             dry_run=_env_bool("STOCKBOT_DRY_RUN", True),
             max_position_fraction=float(os.environ.get("STOCKBOT_MAX_POSITION_FRAC", "0.1")),
             max_daily_trades=int(os.environ.get("STOCKBOT_MAX_DAILY_TRADES", "1")),
+            enable_premarket_signals=_env_bool(
+                "STOCKBOT_ENABLE_PREMARKET_SIGNALS", ENABLE_PREMARKET_SIGNALS
+            ),
+            alpaca_data_feed=os.environ.get("STOCKBOT_ALPACA_DATA_FEED", "iex").strip().lower()
+            or "iex",
         )

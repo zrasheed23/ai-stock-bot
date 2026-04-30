@@ -21,10 +21,15 @@ for _s in ("UNH", "LLY", "SPY"):
     _SYMBOL_SECTOR_THEME[_s] = "DEFENSIVE"
 
 
-def _slot1_slot2_same_sector_theme(c1: ScoredCandidate, c2: ScoredCandidate) -> bool:
-    b1 = _SYMBOL_SECTOR_THEME.get(c1.symbol.upper())
-    b2 = _SYMBOL_SECTOR_THEME.get(c2.symbol.upper())
+def symbols_same_sector_theme(sym_a: str, sym_b: str) -> bool:
+    """True when both symbols map to the same coarse sector bucket (opening + pipeline sizing)."""
+    b1 = _SYMBOL_SECTOR_THEME.get(sym_a.strip().upper())
+    b2 = _SYMBOL_SECTOR_THEME.get(sym_b.strip().upper())
     return b1 is not None and b2 is not None and b1 == b2
+
+
+def _slot1_slot2_same_sector_theme(c1: ScoredCandidate, c2: ScoredCandidate) -> bool:
+    return symbols_same_sector_theme(c1.symbol, c2.symbol)
 
 
 # -----------------------------------------------------------------------------

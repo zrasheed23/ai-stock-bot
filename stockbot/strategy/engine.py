@@ -8,6 +8,15 @@ from dataclasses import replace
 from datetime import date
 from typing import Any, Sequence
 
+from stockbot.config import (
+    PM_GAP_ATR_HARD_SKIP,
+    PM_GAP_ATR_WARN,
+    PM_RVOL_STRONG,
+    SPY_GAP_ATR_NO_TRADE,
+    SPY_GAP_ATR_REDUCE,
+    Settings,
+)
+from stockbot.features.premarket import premarket_score_adjustment
 from stockbot.features.sentiment import sentiment_features_from_llm
 from stockbot.features.technical import technical_features
 from stockbot.models import (
@@ -24,6 +33,7 @@ from stockbot.execution.orders import (
     capital_fractions_for_chosen_slots,
 )
 from stockbot.risk.engine import MAX_LIVE_TRADES_PER_DAY
+from stockbot.runners.managed_position_ledger import STOP_LOSS_PCT
 
 _LOG = logging.getLogger("stockbot.strategy")
 
@@ -51,14 +61,26 @@ PULLBACK_SOFT_RANK_PENALTY = 0.10
 ENTRY_HARD_MOMENTUM_FLOOR = -0.14
 ENTRY_HARD_SMA_FLOOR = -0.10
 
+# -----------------------------------------------------------------------------
+# Slot-1 selection quality only (higher bar than generic min_score_to_trade).
+# Mirrors exit stop magnitude via ``STOP_LOSS_PCT`` for asymmetry vs expected range.
+# Slot-2 gates and pairing logic are unchanged.
+# -----------------------------------------------------------------------------
+SLOT1_MIN_RAW_SCORE = 1.14
+SLOT1_MIN_LLM_CONFIDENCE = 0.68
+SLOT1_MIN_SENTIMENT_SCORE = 0.12
+# Typical daily range proxy as fraction of price (ATR14/close or vol fallback).
+SLOT1_MIN_EXPECTED_MOVE_PCT = 0.012
+SLOT1_MIN_MOVE_TO_STOP_RATIO = 1.50
+
 # Trade #2: same vol/score gates; relax mom/sma from 0.01 to 0.0 so slot-2 is not double-strict vs slot-1.
 TRADE2_MOM_SMA_TECH_FLOOR = 0.0
 
 # -----------------------------------------------------------------------------
 # Slot-2 weak same-theme pairing (portfolio construction only — NOT ranking/signals)
 #
-# Slot 1 unchanged. Natural slot 2 = first other name in adjusted-rank order passing all
-# existing trade-#2 gates (unchanged).
+# Trade #1 uses extra slot-1 quality gates (score/confidence/expected-move vs stop); see constants above.
+# Natural slot 2 = first other name in adjusted-rank order passing all existing trade-#2 gates (unchanged).
 #
 # If natural slot 2 is NOT in the same mapped sector bucket as slot 1 → keep natural.
 # If same sector: keep natural when slot-2 raw score is already strong (shares
@@ -83,6 +105,48 @@ for _s in ("UNH", "LLY", "SPY"):
 
 def _sector_bucket(symbol: str) -> str | None:
     return _SYMBOL_SECTOR.get(symbol.upper())
+
+
+def _expected_intraday_move_pct(technical: dict[str, float]) -> float | None:
+    """Fraction-of-price proxy for typical daily range (ATR/price preferred)."""
+    last = float(technical.get("last_close", 0.0))
+    atr = technical.get("atr14")
+    if last > 0 and atr is not None:
+        a = float(atr)
+        if math.isfinite(a) and a > 0:
+            return a / last
+    vol_ann = float(technical.get("volatility_ann", 0.0))
+    if vol_ann > 0 and math.isfinite(vol_ann):
+        daily_sigma = vol_ann / math.sqrt(252.0)
+        return float(daily_sigma * 1.28)
+    return None
+
+
+def _slot1_quality_gate(
+    cand: ScoredCandidate,
+    *,
+    stop_distance_abs: float,
+) -> tuple[bool, float, float, str]:
+    """Returns (accepted, llm_confidence, expected_move_pct, reject_reason_code)."""
+    conf = float(cand.features.sentiment.get("llm_confidence", 0.0))
+    sent = float(cand.features.sentiment.get("sentiment_score", 0.0))
+    raw = float(cand.score)
+    tech = cand.features.technical
+    exp = _expected_intraday_move_pct(tech)
+    exp_for_metrics = exp if exp is not None else 0.0
+
+    if raw < SLOT1_MIN_RAW_SCORE:
+        return False, conf, exp_for_metrics, "LOW_RAW_SCORE"
+    if conf < SLOT1_MIN_LLM_CONFIDENCE:
+        return False, conf, exp_for_metrics, "LOW_CONFIDENCE"
+    if sent < SLOT1_MIN_SENTIMENT_SCORE:
+        return False, conf, exp_for_metrics, "LOW_SENTIMENT_SCORE"
+    if exp is None:
+        return False, conf, 0.0, "NO_MOVE_ESTIMATE"
+    floor = max(SLOT1_MIN_EXPECTED_MOVE_PCT, stop_distance_abs * SLOT1_MIN_MOVE_TO_STOP_RATIO)
+    if exp < floor:
+        return False, conf, exp, "LOW_EXPECTED_MOVE"
+    return True, conf, exp, ""
 
 
 def _slot2_meaningful_cluster(trade_one: ScoredCandidate, cand: ScoredCandidate) -> bool:
@@ -122,19 +186,54 @@ def _trade_two_gate_failures(
     return failures
 
 
+# Manually curated trade universe (single source of truth for default watchlist).
+SYMBOL_UNIVERSE: tuple[str, ...] = (
+    # Core ETFs
+    "SPY",
+    "QQQ",
+    "IWM",
+    "XLK",
+    "XLF",
+    "XLE",
+    "XLV",
+    "XLY",
+    # Mega caps
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "AMZN",
+    "META",
+    "GOOGL",
+    "TSLA",
+    # High-volatility large caps
+    "AMD",
+    "SMCI",
+    "AVGO",
+    "NFLX",
+    "SHOP",
+    "PLTR",
+    "COIN",
+    # Financial / macro movers
+    "JPM",
+    "GS",
+    "BAC",
+    # Industrial / cyclical
+    "CAT",
+    "BA",
+    # Growth / momentum names
+    "SNOW",
+    "CRWD",
+    "PANW",
+    "DDOG",
+    # High-beta names
+    "RIVN",
+    "LCID",
+    "AFRM",
+)
+
+
 def default_watchlist() -> list[str]:
-    return [
-        "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "AMD", "TSLA",
-        "JPM",
-        "GS",
-        "UNH",
-        "LLY",
-        "XOM",
-        "CVX",
-        "SPY",
-        "XLE",
-        "XLF",
-    ]
+    return list(SYMBOL_UNIVERSE)
 
 
 class StrategyEngine:
@@ -150,6 +249,8 @@ class StrategyEngine:
     ):
         self._watchlist = [s.upper() for s in (watchlist or default_watchlist())]
         self._max_candidates = max_candidates
+        _LOG.info("UNIVERSE_SIZE total_symbols=%d", len(self._watchlist))
+        _LOG.info("UNIVERSE_SYMBOLS symbols=%s", self._watchlist)
 
     @property
     def watchlist(self) -> list[str]:
@@ -181,7 +282,11 @@ class StrategyEngine:
             )
         return vecs
 
-    def score(self, fv: FeatureVector) -> tuple[float, dict[str, float]]:
+    def score(
+        self,
+        fv: FeatureVector,
+        premarket_row: dict[str, Any] | None = None,
+    ) -> tuple[float, dict[str, float]]:
         t = fv.technical
         s = fv.sentiment
         breakdown: dict[str, float] = {}
@@ -230,6 +335,21 @@ class StrategyEngine:
             breakdown["bullish_boost"] = 0.0
 
         total = float(sum(breakdown.values()))
+        if (
+            premarket_row
+            and not premarket_row.get("fetch_error")
+            and premarket_row.get("pm_ref_price") is not None
+            and premarket_row.get("prior_rth_close") is not None
+        ):
+            pm_adj = premarket_score_adjustment(
+                float(premarket_row.get("gap_atr", 0.0)),
+                float(premarket_row.get("pm_rvol", 1.0)),
+                pm_gap_atr_hard_skip=PM_GAP_ATR_HARD_SKIP,
+                pm_gap_atr_warn=PM_GAP_ATR_WARN,
+                pm_rvol_strong=PM_RVOL_STRONG,
+            )
+            breakdown["premkt_score_adj"] = float(pm_adj)
+            total += float(pm_adj)
         return total, breakdown
 
     def decide(
@@ -237,12 +357,50 @@ class StrategyEngine:
         trade_date: date,
         bundle: IngestionBundle,
         llm_by_symbol: dict[str, LLMInstrumentView],
+        settings: Settings | None = None,
     ) -> StrategyDecision:
+        settings = settings or Settings.from_env()
         reason_codes: list[str] = []
         cooldown_skips: list[dict[str, Any]] = []
         soft_modifiers: list[dict[str, Any]] = []
-        fvecs = self.build_features(bundle, llm_by_symbol)
-        if not fvecs:
+        risk_mult = 1.0
+        prem = bundle.premarket or {}
+        active_pm = bool(
+            settings.enable_premarket_signals and prem and not prem.get("disabled_session")
+        )
+        if active_pm:
+            spy_ga = float((prem.get("spy") or {}).get("gap_atr", 0.0))
+            if spy_ga < SPY_GAP_ATR_NO_TRADE:
+                return StrategyDecision(
+                    trade_date=trade_date,
+                    watchlist=self._watchlist,
+                    ranked=[],
+                    chosen=[],
+                    reason_codes=["NO_TRADE_MARKET_CONDITIONS"],
+                    candidate_outcomes=[],
+                    cooldown_skips=cooldown_skips,
+                    soft_modifiers=soft_modifiers,
+                    capital_fractions=[],
+                    risk_notional_multiplier=1.0,
+                )
+            if spy_ga < SPY_GAP_ATR_REDUCE:
+                risk_mult = 0.5
+                reason_codes.append("SPY_RISK_REDUCTION")
+
+        skip_syms: set[str] = set()
+        if active_pm:
+            for sym, row in (prem.get("symbols") or {}).items():
+                hr = row.get("hard_skip_reason")
+                if hr == "PM_GAP_TOO_LARGE":
+                    skip_syms.add(sym.upper())
+                    reason_codes.append("PM_GAP_TOO_LARGE")
+                elif hr == "PM_LOW_VOLUME_ON_GAP":
+                    skip_syms.add(sym.upper())
+                    reason_codes.append("PM_LOW_VOLUME_ON_GAP")
+
+        fvecs_all = self.build_features(bundle, llm_by_symbol)
+        fvecs = [fv for fv in fvecs_all if fv.symbol.upper() not in skip_syms]
+        if not fvecs_all:
             reason_codes.append("NO_FEATURES")
             return StrategyDecision(
                 trade_date=trade_date,
@@ -254,11 +412,28 @@ class StrategyEngine:
                 cooldown_skips=cooldown_skips,
                 soft_modifiers=soft_modifiers,
                 capital_fractions=[],
+                risk_notional_multiplier=risk_mult,
+            )
+        if not fvecs:
+            # All watchlist names filtered (typically pre-market hard skips); PM_* codes already added.
+            return StrategyDecision(
+                trade_date=trade_date,
+                watchlist=self._watchlist,
+                ranked=[],
+                chosen=[],
+                reason_codes=reason_codes,
+                candidate_outcomes=[],
+                cooldown_skips=cooldown_skips,
+                soft_modifiers=soft_modifiers,
+                capital_fractions=[],
+                risk_notional_multiplier=risk_mult,
             )
 
+        sym_rows = (prem.get("symbols") or {}) if active_pm else {}
         full_ranked: list[ScoredCandidate] = []
         for fv in fvecs:
-            total, br = self.score(fv)
+            pm_row = sym_rows.get(fv.symbol) if active_pm else None
+            total, br = self.score(fv, pm_row)
             full_ranked.append(
                 ScoredCandidate(
                     symbol=fv.symbol,
@@ -309,6 +484,8 @@ class StrategyEngine:
             reason_codes.append("NO_TRADE_LOW_SCORE")
         else:
             trade_one: ScoredCandidate | None = None
+            stop_abs = abs(float(STOP_LOSS_PCT))
+            slot1_hard_gate_passed_any = False
             for cand in full_ranked:
                 if cand.score < min_score_to_trade:
                     continue
@@ -317,11 +494,35 @@ class StrategyEngine:
                 sma_bias = float(t.get("sma20_distance", 0.0))
                 if mom < ENTRY_HARD_MOMENTUM_FLOOR or sma_bias < ENTRY_HARD_SMA_FLOOR:
                     continue
+                slot1_hard_gate_passed_any = True
+                ok, conf, exp_move, rej = _slot1_quality_gate(cand, stop_distance_abs=stop_abs)
+                _LOG.info(
+                    "HIGH_QUALITY_TRADE symbol=%s confidence=%.4f expected_move=%.6f accepted=%s",
+                    cand.symbol,
+                    conf,
+                    exp_move,
+                    ok,
+                )
+                if not ok:
+                    soft_modifiers.append(
+                        {
+                            "reason": "SLOT1_QUALITY_REJECT",
+                            "symbol": cand.symbol,
+                            "reject_code": rej,
+                            "confidence": round(conf, 4),
+                            "expected_move_pct": round(exp_move, 6),
+                            "raw_score": round(float(cand.score), 6),
+                        }
+                    )
+                    continue
                 trade_one = cand
                 break
 
             if trade_one is None:
-                reason_codes.append("SKIP_SHORT_TERM_DOWNTREND")
+                if slot1_hard_gate_passed_any:
+                    reason_codes.append("SKIP_SLOT1_QUALITY_FILTERS")
+                else:
+                    reason_codes.append("SKIP_SHORT_TERM_DOWNTREND")
             else:
                 chosen.append(trade_one)
                 reason_codes.append("CANDIDATE_SELECTED")
@@ -577,4 +778,5 @@ class StrategyEngine:
             cooldown_skips=cooldown_skips,
             soft_modifiers=soft_modifiers,
             capital_fractions=capital_fractions,
+            risk_notional_multiplier=risk_mult,
         )

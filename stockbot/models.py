@@ -44,6 +44,8 @@ class IngestionBundle:
     market: dict[str, MarketSnapshot]
     news: list[NewsItem]
     filings: list[FilingRef]
+    # Pre-market MVP-0 payload from ``stockbot.ingestion.premarket`` (audit + strategy); None = off / absent.
+    premarket: dict[str, Any] | None = None
 
 
 @dataclass
@@ -95,6 +97,8 @@ class StrategyDecision:
     soft_modifiers: list[dict[str, Any]] = field(default_factory=list)
     # Per-leg capital fractions vs max daily sleeve (e.g. [0.7, 0.2]); empty => pipeline defaults.
     capital_fractions: list[float] = field(default_factory=list)
+    # Applied in pipeline to ``RiskEngine.evaluate(..., notional_fraction=...)`` (SPY pre-market risk-off).
+    risk_notional_multiplier: float = 1.0
 
 
 @dataclass

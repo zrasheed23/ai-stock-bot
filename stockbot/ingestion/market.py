@@ -68,6 +68,19 @@ def _ohlc_passes_realism_check(bars: pd.DataFrame) -> bool:
     return True
 
 
+def _alpaca_data_headers(settings: Settings) -> dict[str, str]:
+    """Alpaca Market Data API expects these headers (not HTTP Basic auth)."""
+    return {
+        "APCA-API-KEY-ID": settings.alpaca_api_key,
+        "APCA-API-SECRET-KEY": settings.alpaca_secret_key,
+    }
+
+
+def _alpaca_daily_feed(settings: Settings) -> str:
+    """Respect subscription: OpenAPI default feed is ``sip``; many paper accounts need ``iex``."""
+    return (settings.alpaca_data_feed or "iex").strip().lower() or "iex"
+
+
 def _alpaca_bars(
     symbol: str,
     settings: Settings,
@@ -77,15 +90,15 @@ def _alpaca_bars(
     """Fetch daily bars from Alpaca data API v2. Returns empty DataFrame if no bars (never synthetic)."""
     start = end - timedelta(days=lookback_days * 2)
     data_url = f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
-    params = {
+    params: dict[str, Any] = {
         "timeframe": "1Day",
         "start": start.date().isoformat(),
         "end": end.date().isoformat(),
         "limit": 10000,
         "adjustment": "split",
+        "feed": _alpaca_daily_feed(settings),
     }
-    auth = (settings.alpaca_api_key, settings.alpaca_secret_key)
-    r = requests.get(data_url, params=params, auth=auth, timeout=30)
+    r = requests.get(data_url, headers=_alpaca_data_headers(settings), params=params, timeout=30)
     r.raise_for_status()
     payload = r.json()
     bars = payload.get("bars") or []
