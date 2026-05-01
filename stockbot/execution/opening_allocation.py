@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 from stockbot.execution.orders import symbols_same_sector_theme
@@ -123,6 +123,8 @@ class OpeningAllocationConfig:
     mm_max_gap_counter_trend_pct: float = 0.0
     # SPY intraday return from packet market_context must align with direction (risk-on / risk-off).
     mm_spy_min_signed_alignment_pct: float = 0.0
+    # Set True when ``opening_allocation_config_from_env()`` sees STOCKBOT_SLOT2_RELAX_OPENING (conservative slot2).
+    slot2_relaxed_opening: bool = False
 
 
 # Stricter Step 4 profile for ~10:30 ET session only (does not alter opening defaults above).
@@ -146,7 +148,23 @@ MIDMORNING_ALLOCATION_CONFIG = OpeningAllocationConfig(
     dominance_margin=0.036,
     dominance_bypass_rank1_min=0.78,
     dominance_bypass_em_min=0.019,
+    slot2_relaxed_opening=False,
 )
+
+
+def opening_allocation_config_from_env() -> OpeningAllocationConfig:
+    """Opening Step 4 config; optional conservative slot2 relaxation via ``STOCKBOT_SLOT2_RELAX_OPENING``."""
+    import os
+
+    base = OpeningAllocationConfig()
+    if os.environ.get("STOCKBOT_SLOT2_RELAX_OPENING", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return base
+    return replace(
+        base,
+        slot2_relaxed_opening=True,
+        slot2_min_expected_move=min(0.0105, base.slot2_min_expected_move),
+        slot2_max_gap_vs_rank1=min(0.054, base.slot2_max_gap_vs_rank1 + 0.006),
+    )
 
 
 @dataclass
@@ -387,7 +405,13 @@ def opening_two_leg_capital_weights(
         row2 = None
     em2 = _premarket_expected_move_proxy(row2)
     overlap = symbols_same_sector_theme(sym1, sym2)
-    elite = overlap and gap <= 0.032 and c2 >= 0.705
+    rx = config.slot2_relaxed_opening
+    elite_gap_lim = 0.034 if rx else 0.032
+    elite_c2_floor = 0.702 if rx else 0.705
+    elite = overlap and gap <= elite_gap_lim and c2 >= elite_c2_floor
+
+    min_conf_keep = 0.678 if rx else _OPENING_SLOT2_MIN_CONF_KEEP
+    gap_skip = 0.072 if rx else _OPENING_SLOT2_GAP_SKIP
 
     def _log_weight(final_w2: float, reason: str) -> None:
         em_str = "na" if em2 is None else f"{em2:.6f}"
@@ -424,7 +448,7 @@ def opening_two_leg_capital_weights(
         )
         return [1.0], [a1], rej_out
 
-    if c2 < _OPENING_SLOT2_MIN_CONF_KEEP:
+    if c2 < min_conf_keep:
         _log_slot2_reject(
             "SLOT2_REJECT_STRIP_LOW_CONFIDENCE",
             rank2_confidence=c2,
@@ -442,7 +466,7 @@ def opening_two_leg_capital_weights(
         )
         return [1.0], [a1], rej_out
 
-    if not elite and (gap >= _OPENING_SLOT2_GAP_SKIP or (gap > 0.048 and c2 < 0.675)):
+    if not elite and (gap >= gap_skip or (gap > 0.048 and c2 < 0.675)):
         _log_slot2_reject(
             "SLOT2_REJECT_STRIP_LARGE_GAP_OR_WEAK",
             rank2_confidence=c2,
@@ -466,6 +490,9 @@ def opening_two_leg_capital_weights(
     elif gap <= 0.05:
         w1, w2 = 0.75, 0.25
         reason = "tight_confidence_gap"
+    elif rx:
+        w1, w2 = 0.88, 0.12
+        reason = "moderate_gap_slot2_weight_12_relaxed"
     else:
         w1, w2 = 0.85, 0.15
         reason = "moderate_gap_slot2_weight_15"

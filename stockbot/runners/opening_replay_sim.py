@@ -71,16 +71,6 @@ def fetch_rth_1min_bars(symbol: str, session_date: date, settings: Settings) -> 
     return fetch_rth_1min_full_session(symbol, session_date, settings)
 
 
-def _rth_bars_for_session_date(df: pd.DataFrame, session_date: date) -> pd.DataFrame:
-    """Drop stray rows not on ``session_date`` in America/New_York (tape boundary hygiene)."""
-    if df is None or df.empty:
-        return df if df is not None else pd.DataFrame()
-    idx = pd.to_datetime(df.index, utc=True).tz_convert(_ET)
-    mask = [bool(ts.date() == session_date) for ts in idx]
-    out = df.loc[mask]
-    return out.sort_index() if not out.empty else out
-
-
 def _entry_bar_and_price(df: pd.DataFrame, session_date: date) -> tuple[pd.Timestamp | None, float | None]:
     if df is None or df.empty:
         return None, None
@@ -281,6 +271,20 @@ def _print_opening_diagnostic_summary(summary: Mapping[str, Any]) -> None:
     print(f"soft_band_accepted_count={summary.get('soft_band_accepted_count', 0)}")
     print(f"allocation_ready_plan_blocked_days={summary.get('allocation_ready_plan_blocked_days', 0)}")
     print("(allocation_ready_plan_blocked_days = Step 4 ready but validated plan had no instructions)")
+    oeb = summary.get("opening_execution_plan_block_failure_counts") or {}
+    print("opening_execution_plan_block_failure_counts:")
+    if not oeb:
+        print("  (none)")
+    else:
+        for k in sorted(oeb.keys()):
+            print(f"  {k}: {oeb[k]}")
+    msr = summary.get("midmorning_skip_primary_reason_counts") or {}
+    print("midmorning_skip_primary_reason_counts:")
+    if not msr:
+        print("  (none)")
+    else:
+        for k in sorted(msr.keys()):
+            print(f"  {k}: {msr[k]}")
     print(f"opening_trade_count={summary.get('opening_trade_count', 0)}")
     print(f"midmorning_trade_count={summary.get('midmorning_trade_count', 0)}")
     print(f"opening_sim_data_missing_count={summary.get('opening_sim_data_missing_count', 0)}")
@@ -454,7 +458,7 @@ def run_opening_replay_range(
     use_ai_cache: bool,
     cache_dir: Path,
     replay_out_dir: Path,
-    enable_midmorning: bool = False,
+    enable_midmorning: bool = True,
 ) -> dict[str, Any]:
     """
     Iterate weekdays in [start, end]; write CSV + JSON summary under ``replay_out_dir``.
@@ -510,6 +514,8 @@ def run_opening_replay_range(
     debug_no_trade_dates: list[str] = []
     debug_allocation_blocked_dates: list[str] = []
     debug_step2_candidate_issue_dates: list[str] = []
+    opening_execution_plan_block_diag_agg: Counter[str] = Counter()
+    midmorning_skip_primary_reason_agg: Counter[str] = Counter()
 
     d = start
     while d <= end:
@@ -560,12 +566,15 @@ def run_opening_replay_range(
                 if odm.get("source_override_applied"):
                     debug_source_override_dates.append(d.isoformat())
 
+            exec_dx_open = through.get("execution_plan_block_diagnosis")
+            if isinstance(exec_dx_open, Mapping) and exec_dx_open.get("ok") is False:
+                opening_execution_plan_block_diag_agg[str(exec_dx_open.get("failure_code") or "unknown")] += 1
+
             rth_cache: dict[str, pd.DataFrame] = {}
 
             def _day_rth(sym_u: str) -> pd.DataFrame:
                 if sym_u not in rth_cache:
-                    raw = fetch_rth_1min_bars(sym_u, d, settings)
-                    rth_cache[sym_u] = _rth_bars_for_session_date(raw, d)
+                    rth_cache[sym_u] = fetch_rth_1min_bars(sym_u, d, settings)
                 return rth_cache[sym_u]
 
             cand_miss = _count_step2_opening_candidates_missing_or_invalid(step2, validated_decision)
@@ -822,6 +831,25 @@ def run_opening_replay_range(
 
                 if not _would_submit(mm_plan):
                     midmorning_skip_filters_days += 1
+                    mp = mm_through.get("midmorning_pipeline_outcome") or {}
+                    if not mp.get("sector_rs_filter_pass"):
+                        midmorning_skip_primary_reason_agg[
+                            f"sector_rs:{mp.get('sector_rs_skip_reason') or 'unknown'}"
+                        ] += 1
+                    elif mp.get("step4_preparation_status") != "ready":
+                        midmorning_skip_primary_reason_agg[
+                            f"step4:{mp.get('step4_preparation_status') or 'unknown'}"
+                        ] += 1
+                    elif mp.get("validated_execution_status") == "no_execution":
+                        ddx = mp.get("execution_plan_diagnosis")
+                        fc = (
+                            str(ddx.get("failure_code") or "unknown")
+                            if isinstance(ddx, Mapping)
+                            else "no_diagnosis"
+                        )
+                        midmorning_skip_primary_reason_agg[f"plan_validate:{fc}"] += 1
+                    else:
+                        midmorning_skip_primary_reason_agg["no_instructions_other"] += 1
                 else:
                     midmorning_plan_trade_days += 1
                     s2_mm = step2_row_by_symbol(mm_through["step2_packet"])
@@ -1115,6 +1143,8 @@ def run_opening_replay_range(
         "no_candidates_empty_days": no_candidates_empty_total,
         "decision_status_not_trade_days": decision_status_not_trade_total,
         "allocation_ready_plan_blocked_days": allocation_ready_plan_blocked_days,
+        "opening_execution_plan_block_failure_counts": dict(sorted(opening_execution_plan_block_diag_agg.items())),
+        "midmorning_skip_primary_reason_counts": dict(sorted(midmorning_skip_primary_reason_agg.items())),
         "opening_initial_no_trade_subtype_counts": dict(sorted(opening_initial_no_trade_subtype_agg.items())),
         "source_override_count": int(source_override_budget.get("used", 0)),
         "source_override_budget_max": int(source_override_budget.get("max", 0)),
@@ -1155,10 +1185,12 @@ def main() -> None:
         help="Read/write var/replay/opening_ai_cache/<date>.json; skip Anthropic when that file exists.",
     )
     p.add_argument(
-        "--midmorning",
-        action="store_true",
-        help="After opening, simulate ~10:30 ET mid-morning window (deterministic sector RS path).",
+        "--no-midmorning",
+        dest="midmorning",
+        action="store_false",
+        help="Opening-only replay: skip ~10:30 ET mid-morning simulation.",
     )
+    p.set_defaults(midmorning=True)
     args = p.parse_args()
     start = date.fromisoformat(args.start)
     end = date.fromisoformat(args.end)

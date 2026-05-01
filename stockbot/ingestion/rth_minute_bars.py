@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time as _time_stdlib
 from datetime import date, datetime, time, timezone
 from typing import Any
 
@@ -34,6 +35,39 @@ def _body_preview(text: str, limit: int = 400) -> str:
     if len(t) <= limit:
         return t
     return t[: limit - 3] + "..."
+
+
+def _get_with_429_retries(
+    url: str,
+    headers: dict[str, str],
+    params: dict[str, Any],
+    *,
+    symbol: str,
+    max_attempts: int = 8,
+) -> requests.Response:
+    """Alpaca data tier often returns 429 under burst replay; retry without changing bar semantics."""
+    last: requests.Response | None = None
+    for attempt in range(max_attempts):
+        try:
+            last = requests.get(url, headers=headers, params=params, timeout=60)
+        except requests.RequestException as exc:
+            _LOG.warning("[rth_1min] fetch failed %s: %s", symbol, exc)
+            raise
+        if last.status_code != 429:
+            return last
+        if attempt + 1 >= max_attempts:
+            break
+        delay_s = min(60.0, 1.5**attempt)
+        _LOG.warning(
+            "[rth_1min] HTTP 429 symbol=%s page retry %s/%s sleep=%.1fs",
+            symbol,
+            attempt + 1,
+            max_attempts,
+            delay_s,
+        )
+        _time_stdlib.sleep(delay_s)
+    assert last is not None
+    return last
 
 
 def fetch_rth_1min_bars_range(
@@ -76,7 +110,7 @@ def fetch_rth_1min_bars_range(
         elif "page_token" in params:
             del params["page_token"]
         try:
-            r = requests.get(url, headers=_headers(settings), params=params, timeout=60)
+            r = _get_with_429_retries(url, _headers(settings), params, symbol=sym_u)
         except requests.RequestException as exc:
             _LOG.warning("[rth_1min] fetch failed %s: %s", sym_u, exc)
             break

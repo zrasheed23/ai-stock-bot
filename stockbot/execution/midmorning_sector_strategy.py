@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import date, time
@@ -33,6 +34,32 @@ MIN_SYMBOL_RTH_RETURN = 0.008
 MIN_RANGE_POSITION = 0.80
 MIN_VOLUME = 750_000
 MAX_PULLBACK_FROM_HIGH_OF_RANGE = 0.35
+
+
+@dataclass(frozen=True)
+class MidmorningTapeThresholds:
+    leading_sector_min: float
+    symbol_rth_min: float
+    range_pos_min: float
+    volume_min: int
+
+
+def midmorning_tape_thresholds(*, relaxed: bool) -> MidmorningTapeThresholds:
+    """Strict defaults; ``relaxed`` applies small deltas when ``STOCKBOT_MIDMORNING_RELAX_FILTERS`` is set."""
+    if relaxed:
+        return MidmorningTapeThresholds(
+            leading_sector_min=MIN_LEADING_SECTOR_RETURN * 0.94,
+            symbol_rth_min=MIN_SYMBOL_RTH_RETURN * 0.95,
+            range_pos_min=max(0.72, MIN_RANGE_POSITION - 0.04),
+            volume_min=int(MIN_VOLUME * 0.92),
+        )
+    return MidmorningTapeThresholds(
+        leading_sector_min=MIN_LEADING_SECTOR_RETURN,
+        symbol_rth_min=MIN_SYMBOL_RTH_RETURN,
+        range_pos_min=MIN_RANGE_POSITION,
+        volume_min=MIN_VOLUME,
+    )
+
 
 # Watchlist symbol → sector/style ETF (must be one of _LEADERSHIP_ETFS). None = not eligible as MM stock pick.
 _MIDMORNING_SYMBOL_SECTOR_ETF: dict[str, str] = {}
@@ -119,6 +146,8 @@ class MidmorningSelectionResult:
     midmorning_skip_reason: str
     spy_rth_return_pct: float | None
     qqq_rth_return_pct: float | None
+    # Populated when eligible RS names exist but none pass tape filters (skip reason probe).
+    diagnostic_tape_failures: tuple[tuple[str, str], ...] = ()
 
     def log_fields(self) -> dict[str, Any]:
         base = asdict(self)
@@ -206,6 +235,7 @@ def _skip_result(
     qqq_ret: float | None,
     leader: str | None = None,
     leader_ret: float | None = None,
+    tape_failures: tuple[tuple[str, str], ...] = (),
 ) -> tuple[MidmorningSelectionResult, MidmorningBarStats | None]:
     r = MidmorningSelectionResult(
         midmorning_leading_sector=leader,
@@ -223,12 +253,17 @@ def _skip_result(
         midmorning_skip_reason=reason,
         spy_rth_return_pct=spy_ret,
         qqq_rth_return_pct=qqq_ret,
+        diagnostic_tape_failures=tape_failures,
     )
     _emit_selection_log(r)
     return r, None
 
 
-def _passes_tape_filters(st: MidmorningBarStats) -> tuple[bool, str, bool | None]:
+def _passes_tape_filters(
+    st: MidmorningBarStats,
+    *,
+    thr: MidmorningTapeThresholds,
+) -> tuple[bool, str, bool | None]:
     sr = st.rth_return_pct
     rp = st.rth_close_position_in_range
     vol = st.rth_volume_total
@@ -237,11 +272,11 @@ def _passes_tape_filters(st: MidmorningBarStats) -> tuple[bool, str, bool | None
     lo = st.rth_low
     vw = st.rth_vwap
 
-    if sr is None or sr <= MIN_SYMBOL_RTH_RETURN:
+    if sr is None or sr <= thr.symbol_rth_min:
         return False, "symbol_return_below_min", None
-    if rp is None or rp < MIN_RANGE_POSITION:
+    if rp is None or rp < thr.range_pos_min:
         return False, "range_position_below_min", None
-    if vol is None or vol < MIN_VOLUME:
+    if vol is None or vol < thr.volume_min:
         return False, "volume_below_min", None
 
     vwap_ok: bool | None = None
@@ -270,6 +305,22 @@ def select_midmorning_long(
     """
     Deterministic mid-morning long: sector leadership + RS vs SPY + RS vs sector ETF + tape filters.
     """
+    relaxed_mm = os.environ.get("STOCKBOT_MIDMORNING_RELAX_FILTERS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    thr = midmorning_tape_thresholds(relaxed=relaxed_mm)
+    if relaxed_mm:
+        _LOG.info(
+            "MIDMORNING_RELAX_FILTERS active leading_min=%.6f sym_rth_min=%.6f range_min=%.4f vol_min=%s",
+            thr.leading_sector_min,
+            thr.symbol_rth_min,
+            thr.range_pos_min,
+            thr.volume_min,
+        )
+
     wl_raw = [str(s).strip().upper() for s in watchlist if str(s).strip()]
     need_syms = sorted(set(wl_raw) | set(_BENCHMARKS) | set(_LEADERSHIP_ETFS))
 
@@ -300,7 +351,7 @@ def select_midmorning_long(
 
     leadership_candidates.sort(key=lambda x: (-x[1], x[0]))
     leader, leader_ret = leadership_candidates[0]
-    if leader_ret <= MIN_LEADING_SECTOR_RETURN:
+    if leader_ret <= thr.leading_sector_min:
         return _skip_result(
             reason="leading_sector_return_below_min",
             spy_ret=spy_ret,
@@ -353,17 +404,25 @@ def select_midmorning_long(
 
     passed: list[tuple[str, MidmorningBarStats, str, float, float, float, bool | None]] = []
     for sym, st, sector_etf, rs_spy, rs_sec, sr in eligible:
-        ok_f, _reason_f, vw_ok = _passes_tape_filters(st)
+        ok_f, _reason_f, vw_ok = _passes_tape_filters(st, thr=thr)
         if ok_f:
             passed.append((sym, st, sector_etf, rs_spy, rs_sec, sr, vw_ok))
 
     if not passed:
+        fails_list: list[tuple[str, str]] = []
+        for sym, st, sector_etf, rs_spy, rs_sec, sr in eligible:
+            ok_f, reason_f, _ = _passes_tape_filters(st, thr=thr)
+            if not ok_f:
+                fails_list.append((sym, reason_f))
+        fails = tuple(fails_list)
+        _LOG.info("MIDMORNING_TAPE_FAILURES leader=%s failures=%s", leader, fails)
         return _skip_result(
             reason="no_watchlist_symbol_passes_tape_filters",
             spy_ret=spy_ret,
             qqq_ret=qqq_ret,
             leader=leader,
             leader_ret=leader_ret,
+            tape_failures=fails,
         )
 
     passed.sort(
@@ -393,6 +452,7 @@ def select_midmorning_long(
         midmorning_skip_reason="",
         spy_rth_return_pct=spy_ret,
         qqq_rth_return_pct=qqq_ret,
+        diagnostic_tape_failures=(),
     )
     _emit_selection_log(out)
     return out, pick_st

@@ -15,6 +15,10 @@ _LOG = logging.getLogger("stockbot.config")
 # Master switch default; override with env ``STOCKBOT_ENABLE_PREMARKET_SIGNALS=0``.
 ENABLE_PREMARKET_SIGNALS = True
 
+# Optional conservative behavior toggles (opening / mid-morning only; default off).
+# STOCKBOT_SLOT2_RELAX_OPENING=1 — slightly easier slot-2 acceptance + smaller slot-2 weight when borderline.
+# STOCKBOT_MIDMORNING_RELAX_FILTERS=1 — small tape-threshold deltas for sector-RS mid-morning path.
+
 PM_GAP_ATR_HARD_SKIP = 2.5
 PM_GAP_ATR_WARN = 1.0
 PM_RVOL_MIN_ON_GAP = 0.3

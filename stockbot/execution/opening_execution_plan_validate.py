@@ -277,3 +277,155 @@ def validate_opening_execution_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
         return _no_execution(plan)
 
     return copy.deepcopy(dict(plan))
+
+
+def diagnose_opening_execution_plan(plan: Any) -> dict[str, Any]:
+    """
+    Explain why ``validate_opening_execution_plan`` would reject a plan (read-only; no mutation).
+
+    Returns ``{"ok": bool, "failure_code": str | None, "failure_detail": str | None}``.
+    """
+
+    def _fail(code: str, detail: str | None = None) -> dict[str, Any]:
+        return {"ok": False, "failure_code": code, "failure_detail": detail}
+
+    if not isinstance(plan, Mapping):
+        return _fail("plan_not_mapping")
+
+    if not _exact_keys(plan, _TOP_LEVEL_KEYS):
+        return _fail("bad_top_level_keys", f"got={sorted(plan.keys())}")
+
+    trade_date = plan["trade_date"]
+    if not isinstance(trade_date, str) or not _valid_yyyy_mm_dd(trade_date):
+        return _fail("bad_trade_date", repr(trade_date))
+
+    policy = plan["as_of_policy"]
+    if not isinstance(policy, Mapping) or not _exact_keys(policy, _POLICY_KEYS):
+        return _fail("bad_as_of_policy")
+
+    du = policy["deployable_usd"]
+    if not _finite_non_negative(du):
+        return _fail("bad_deployable_usd", repr(du))
+
+    mo = policy["min_order_notional"]
+    if not _finite_positive(mo):
+        return _fail("bad_min_order_notional", repr(mo))
+
+    emp = policy["execution_mode_priority"]
+    if not isinstance(emp, list) or emp != _MODE_PRIORITY:
+        return _fail("bad_execution_mode_priority")
+
+    ps = policy["pricing_source"]
+    if not isinstance(ps, str) or ps.strip() == "":
+        return _fail("bad_pricing_source")
+
+    instructions = plan["instructions"]
+    if not isinstance(instructions, list):
+        return _fail("instructions_not_list")
+    if len(instructions) > 3:
+        return _fail("too_many_instructions", str(len(instructions)))
+
+    seen_symbols: set[str] = set()
+    total_leg_cents = 0
+
+    for i, inst in enumerate(instructions):
+        if not isinstance(inst, Mapping) or not _exact_keys(inst, _INSTRUCTION_KEYS):
+            return _fail("bad_instruction_shape", f"index={i}")
+
+        sym = inst["symbol"]
+        if not isinstance(sym, str) or sym.strip() == "":
+            return _fail("bad_instruction_symbol", f"index={i}")
+
+        key = sym.strip().upper()
+        if key in seen_symbols:
+            return _fail("duplicate_instruction_symbol", key)
+        seen_symbols.add(key)
+
+        if inst["side"] != "buy":
+            return _fail("instruction_side_not_buy", f"index={i}")
+        if inst["direction"] != "long":
+            return _fail("instruction_direction_not_long", f"index={i}")
+
+        mode = inst["mode"]
+        if mode not in ("notional_market", "shares_market"):
+            return _fail("bad_instruction_mode", f"index={i} mode={mode!r}")
+
+        rk = inst["rank"]
+        if not _is_int_not_bool(rk) or rk < 1 or rk > 3:
+            return _fail("bad_instruction_rank", f"index={i} rank={rk!r}")
+
+        sf = inst["scheduled_for"]
+        if not _scheduled_for_valid(sf, trade_date):
+            return _fail(
+                "bad_scheduled_for",
+                f"index={i} scheduled_for={sf!r} (expect 09:30 or 10:30 ET on {trade_date})",
+            )
+
+        if mode == "notional_market":
+            if inst["shares"] is not None:
+                return _fail("notional_has_shares", f"index={i}")
+            if inst["ref_price"] is not None:
+                return _fail("notional_has_ref_price", f"index={i}")
+            if not _finite_positive(inst["notional_usd"]):
+                return _fail("bad_notional_usd", f"index={i} nu={inst.get('notional_usd')!r}")
+        else:
+            if not _is_int_not_bool(inst["shares"]) or inst["shares"] < 1:
+                return _fail("bad_shares", f"index={i}")
+            if not _finite_positive(inst["ref_price"]):
+                return _fail("bad_ref_price", f"index={i}")
+            if inst["notional_usd"] is not None:
+                return _fail("shares_mode_has_notional", f"index={i}")
+
+        lc = _instruction_leg_cents(inst)
+        if lc is None:
+            return _fail("instruction_leg_cents_none", f"index={i}")
+        total_leg_cents += lc
+
+    skipped = plan["skipped"]
+    if not isinstance(skipped, list):
+        return _fail("skipped_not_list")
+
+    for j, item in enumerate(skipped):
+        if not isinstance(item, Mapping):
+            return _fail("bad_skip_item", f"index={j}")
+        ks = set(item.keys())
+        if not ks.issubset(_SKIP_ALLOWED_KEYS):
+            return _fail("bad_skip_keys", f"index={j}")
+        if "rank" not in item or "symbol" not in item or "reason_code" not in item:
+            return _fail("skip_missing_required", f"index={j}")
+        if not _is_int_not_bool(item["rank"]):
+            return _fail("bad_skip_rank", f"index={j}")
+        if not isinstance(item["symbol"], str):
+            return _fail("bad_skip_symbol", f"index={j}")
+        if "detail" in item and not isinstance(item["detail"], str):
+            return _fail("bad_skip_detail", f"index={j}")
+        rc = item["reason_code"]
+        if not isinstance(rc, str) or rc not in _SKIP_REASONS:
+            return _fail("bad_skip_reason_code", f"index={j} rc={rc!r}")
+
+    totals = plan["totals"]
+    if not isinstance(totals, Mapping) or not _exact_keys(totals, _TOTALS_KEYS):
+        return _fail("bad_totals")
+
+    rnu = totals["requested_notional_usd"]
+    if not _finite_non_negative(rnu):
+        return _fail("bad_totals_requested_notional", repr(rnu))
+
+    ic = totals["instruction_count"]
+    sc = totals["skipped_count"]
+    if not _is_int_not_bool(ic) or ic < 0 or ic != len(instructions):
+        return _fail(
+            "totals_instruction_count_mismatch",
+            f"ic={ic!r} len_instructions={len(instructions)}",
+        )
+    if not _is_int_not_bool(sc) or sc < 0 or sc != len(skipped):
+        return _fail("totals_skipped_count_mismatch", f"sc={sc!r} len_skipped={len(skipped)}")
+
+    deployable_cents = int(round(float(du) * 100.0))
+    if total_leg_cents > deployable_cents:
+        return _fail(
+            "total_notional_exceeds_deployable",
+            f"leg_cents={total_leg_cents} deployable_cents={deployable_cents}",
+        )
+
+    return {"ok": True, "failure_code": None, "failure_detail": None}

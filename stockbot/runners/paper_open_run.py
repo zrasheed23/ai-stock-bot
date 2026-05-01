@@ -36,10 +36,17 @@ from stockbot.execution.midmorning_sector_strategy import (
     deterministic_midmorning_confidence,
     select_midmorning_long,
 )
-from stockbot.execution.opening_allocation import OpeningAllocationConfig, build_step2_index, prepare_opening_execution
+from stockbot.execution.opening_allocation import (
+    build_step2_index,
+    opening_allocation_config_from_env,
+    prepare_opening_execution,
+)
 from stockbot.execution.opening_source_override import try_source_no_trade_rank1_override
 from stockbot.execution.opening_execution_plan import build_opening_execution_plan
-from stockbot.execution.opening_execution_plan_validate import validate_opening_execution_plan
+from stockbot.execution.opening_execution_plan_validate import (
+    diagnose_opening_execution_plan,
+    validate_opening_execution_plan,
+)
 from stockbot.execution.paper_deployable import deployable_usd_from_alpaca_broker
 from stockbot.ingestion.market import fetch_market_snapshots
 from stockbot.ingestion.premarket import fetch_premarket_for_watchlist
@@ -64,6 +71,42 @@ def _paper_diag_emit(title: str, payload: Any) -> None:
     print(f"\n=== paper_open_run diagnostic: {title} ===", file=sys.stderr, flush=True)
     print(json.dumps(payload, indent=2, default=str), file=sys.stderr, flush=True)
     _LOG.info("paper_open_run diagnostic section: %s", title)
+
+
+def _log_step2_opening_watchlist_issues(step2_packet: Mapping[str, Any], trade_date: date) -> None:
+    """Log unusable Step 2 rows and materially missing fields (opening evaluation hygiene)."""
+    td = step2_packet.get("trade_date", trade_date.isoformat())
+    syms = step2_packet.get("symbols")
+    if not isinstance(syms, list):
+        _LOG.warning("STEP2_PACKET_INVALID trade_date=%s symbols_not_list", td)
+        return
+    for row in syms:
+        if not isinstance(row, Mapping):
+            _LOG.warning("STEP2_ROW_INVALID trade_date=%s row_non_mapping=%r", td, row)
+            continue
+        sym = str(row.get("symbol") or "").strip().upper() or "?"
+        if row.get("status") != "ok":
+            _LOG.warning(
+                "STEP2_ROW_UNUSABLE trade_date=%s symbol=%s status=%r reason=%r alpaca_feed=%r",
+                td,
+                sym,
+                row.get("status"),
+                row.get("reason"),
+                row.get("alpaca_feed"),
+            )
+            continue
+        missing: list[str] = []
+        for field in ("pm_volume", "pm_session_return_pct", "gap_close_vs_prior_close_pct", "prior_rth_close"):
+            if row.get(field) is None:
+                missing.append(field)
+        if missing:
+            _LOG.warning(
+                "STEP2_ROW_MISSING_FIELDS trade_date=%s symbol=%s fields=%s bar_count=%r",
+                td,
+                sym,
+                ",".join(missing),
+                row.get("bar_count"),
+            )
 
 
 def _paper_diag_step2_summary(step2_packet: Mapping[str, Any]) -> dict[str, Any]:
@@ -364,7 +407,10 @@ def run_paper_opening_through_5_5(
         step1_by_symbol,
         {k: market.get(k) for k in watchlist},
     )
+    _log_step2_opening_watchlist_issues(step2_packet, trade_date)
     _paper_diag_emit("Step 2 summary", _paper_diag_step2_summary(step2_packet))
+
+    alloc_cfg = opening_allocation_config_from_env()
 
     expected_td = str(step2_packet.get("trade_date", trade_date.isoformat()))
     if opening_decision_raw_text is not None:
@@ -396,7 +442,7 @@ def run_paper_opening_through_5_5(
             watchlist=watchlist,
             step2_by_symbol=step2_by_override,
             budget=source_no_trade_override_budget,
-            config=OpeningAllocationConfig(),
+            config=alloc_cfg,
             market_read_summary=mr_summary,
         )
         if synth is not None:
@@ -414,6 +460,7 @@ def run_paper_opening_through_5_5(
         validated_decision,
         step2_packet=step2_packet,
         allocation_diagnostics=allocation_diagnostics,
+        config=alloc_cfg,
     )
     _paper_diag_emit(
         "Step 4 allocation",
@@ -446,6 +493,20 @@ def run_paper_opening_through_5_5(
     validated_plan = validate_opening_execution_plan(plan)
     _paper_diag_emit("Step 5.5 validated_plan", dict(validated_plan))
 
+    exec_plan_diagnosis: dict[str, Any] | None = None
+    if (
+        isinstance(step4_allocation, Mapping)
+        and step4_allocation.get("preparation_status") == "ready"
+        and validated_plan.get("execution_status") == "no_execution"
+    ):
+        exec_plan_diagnosis = diagnose_opening_execution_plan(plan)
+        _LOG.warning(
+            "OPENING_EXECUTION_PLAN_BLOCKED trade_date=%s diagnosis=%s skipped=%s",
+            trade_date.isoformat(),
+            exec_plan_diagnosis,
+            plan.get("skipped"),
+        )
+
     return {
         "trade_date": trade_date,
         "watchlist": watchlist,
@@ -461,6 +522,8 @@ def run_paper_opening_through_5_5(
         "plan": plan,
         "validated_plan": validated_plan,
         "opening_decision_meta": opening_decision_meta,
+        "execution_plan_block_diagnosis": exec_plan_diagnosis,
+        "opening_allocation_config_slot2_relaxed": bool(alloc_cfg.slot2_relaxed_opening),
     }
 
 
@@ -603,6 +666,31 @@ def run_paper_midmorning_through_5_5(
     )
     validated_plan = validate_opening_execution_plan(plan)
 
+    mm_plan_diagnosis: dict[str, Any] | None = None
+    if validated_plan.get("execution_status") == "no_execution":
+        mm_plan_diagnosis = diagnose_opening_execution_plan(plan)
+        _LOG.warning(
+            "MIDMORNING_EXECUTION_PLAN_BLOCKED trade_date=%s diagnosis=%s",
+            trade_date.isoformat(),
+            mm_plan_diagnosis,
+        )
+
+    mm_relaxed = os.environ.get("STOCKBOT_MIDMORNING_RELAX_FILTERS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    midmorning_pipeline_outcome: dict[str, Any] = {
+        "midmorning_relaxed_filters_env": mm_relaxed,
+        "sector_rs_filter_pass": sel.midmorning_filter_pass,
+        "sector_rs_skip_reason": sel.midmorning_skip_reason or None,
+        "tape_failure_symbols": [{"symbol": a, "tape_reason": b} for a, b in sel.diagnostic_tape_failures],
+        "step4_preparation_status": step4_allocation.get("preparation_status"),
+        "validated_execution_status": validated_plan.get("execution_status"),
+        "execution_plan_diagnosis": mm_plan_diagnosis,
+    }
+
     opening_decision_meta = {
         "session_phase": "midmorning",
         "strategy": "sector_leadership_rs",
@@ -629,9 +717,13 @@ def run_paper_midmorning_through_5_5(
         or validated_plan.get("execution_status") == "no_execution"
     ):
         _LOG.info(
-            "MIDMORNING_SKIP reason=filters_failed preparation_status=%s execution_status=%s",
+            "MIDMORNING_SKIP reason=filters_or_plan preparation_status=%s execution_status=%s "
+            "sector_skip_reason=%s tape_probe=%s plan_dx=%s",
             step4_allocation.get("preparation_status"),
             validated_plan.get("execution_status"),
+            sel.midmorning_skip_reason or "",
+            midmorning_pipeline_outcome.get("tape_failure_symbols"),
+            mm_plan_diagnosis,
         )
     else:
         trades_pm = step4_allocation.get("trades")
@@ -659,6 +751,7 @@ def run_paper_midmorning_through_5_5(
         "opening_decision_meta": opening_decision_meta,
         "midmorning_reference_prices": mm_refs,
         "midmorning_selection": sel.log_fields(),
+        "midmorning_pipeline_outcome": midmorning_pipeline_outcome,
     }
 
 
@@ -668,7 +761,7 @@ def run_paper_opening_morning(
     settings: Settings | None = None,
     strategy: StrategyEngine | None = None,
     dry_run_no_submit: bool = False,
-    enable_midmorning: bool = False,
+    enable_midmorning: bool = True,
 ) -> dict[str, Any]:
     """
     Orchestration only: Step 1 → … → Step 5.5, then wait for 09:30 ET, then Step 6.
@@ -679,9 +772,9 @@ def run_paper_opening_morning(
     does not submit orders or write the managed-position ledger; prints audit diagnostics and a
     ``would_submit`` summary to stderr.
 
-    With ``enable_midmorning=True``: after opening Step 6 (unless dry-run), waits until 10:30 ET
+    By default (``enable_midmorning=True``): after opening Step 6 (unless dry-run), waits until 10:30 ET
     and runs a second independent pipeline when opening inventory allows it (see ``MIDMORNING_SKIP``
-    logs).
+    logs). Pass ``enable_midmorning=False`` to disable.
     """
     trading_url, _data_url = _require_env()
     if settings is None:
@@ -837,11 +930,12 @@ def main() -> None:
         help="Run Steps 1–5.5 only: no open wait, no orders, no managed-position ledger writes.",
     )
     parser.add_argument(
-        "--midmorning",
-        action="store_true",
-        help="After opening Step 6, wait until 10:30 ET and run the independent mid-morning pipeline "
-        "when opening inventory is flat.",
+        "--no-midmorning",
+        dest="midmorning",
+        action="store_false",
+        help="Skip the ~10:30 ET mid-morning pipeline after opening (default: mid-morning runs when flat).",
     )
+    parser.set_defaults(midmorning=True)
     args = parser.parse_args()
     if args.trade_date:
         td = date.fromisoformat(args.trade_date)
