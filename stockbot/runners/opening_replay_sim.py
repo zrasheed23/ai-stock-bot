@@ -33,6 +33,13 @@ from stockbot.runners.managed_position_ledger import (
     strong_stock_deterministic,
     take_profit_pct_for,
 )
+from stockbot.runners.opening_attribution_report import (
+    analyze_opening_records,
+    build_opening_attrib_record,
+    print_opening_attribution_summary,
+    relaxed_opening_env_label,
+    write_opening_attribution_json,
+)
 from stockbot.runners.paper_open_run import run_paper_opening_through_5_5
 from stockbot.strategy.engine import StrategyEngine
 
@@ -259,6 +266,8 @@ def _print_opening_diagnostic_summary(summary: Mapping[str, Any]) -> None:
     else:
         for k in sorted(orc.keys()):
             print(f"  {k}: {orc[k]}")
+    print(f"opening_surgical_pm_return_reject_total={summary.get('opening_surgical_pm_return_reject_total', 0)}")
+    print(f"opening_surgical_expected_move_reject_total={summary.get('opening_surgical_expected_move_reject_total', 0)}")
     print(f"decision_status_not_trade_days={summary.get('decision_status_not_trade_days', 0)}")
     print(f"no_candidates_empty_days={summary.get('no_candidates_empty_days', 0)}")
     print(f"confidence_pass_direction_fail_count={summary.get('confidence_pass_direction_fail_count', 0)}")
@@ -516,6 +525,11 @@ def run_opening_replay_range(
     debug_step2_candidate_issue_dates: list[str] = []
     opening_execution_plan_block_diag_agg: Counter[str] = Counter()
     midmorning_skip_primary_reason_agg: Counter[str] = Counter()
+    opening_surgical_pm_reject_total = 0
+    opening_surgical_em_reject_total = 0
+
+    relaxed_opening_env_snapshot = relaxed_opening_env_label()
+    opening_attrib_records: list[dict[str, Any]] = []
 
     d = start
     while d <= end:
@@ -560,6 +574,7 @@ def run_opening_replay_range(
             validated_decision = through["validated_decision"]
             validated_plan = through["validated_plan"]
             odm = through.get("opening_decision_meta")
+            src_ov_applied = bool(isinstance(odm, Mapping) and odm.get("source_override_applied"))
             if isinstance(odm, Mapping):
                 if odm.get("initial_decision_status") == "no_trade":
                     opening_initial_no_trade_subtype_agg[str(odm.get("no_trade_subtype") or "unknown")] += 1
@@ -592,6 +607,8 @@ def run_opening_replay_range(
                 if isinstance(adx, Mapping):
                     for rk, rv in (adx.get("opening_reject_reason_counts") or {}).items():
                         opening_reject_agg[str(rk)] += int(rv)
+                    opening_surgical_pm_reject_total += int(adx.get("opening_surgical_pm_return_reject_count") or 0)
+                    opening_surgical_em_reject_total += int(adx.get("opening_surgical_expected_move_reject_count") or 0)
                     soft_band_candidate_total += int(adx.get("soft_band_candidate_count") or 0)
                     soft_band_expected_move_pass_total += int(adx.get("soft_band_expected_move_pass_count") or 0)
                     soft_band_accepted_total += int(adx.get("soft_band_accepted_count") or 0)
@@ -724,6 +741,25 @@ def run_opening_replay_range(
                     pnl = notional * ret if math.isfinite(ret) else 0.0
                     exit_counts[reason] += 1
                     n_trades += 1
+                    opening_attrib_records.append(
+                        build_opening_attrib_record(
+                            trade_date=d,
+                            symbol=sym,
+                            rank_i=rank_i,
+                            ai_confidence=float(ai_conf),
+                            exit_reason=str(reason),
+                            ret=float(ret) if math.isfinite(ret) else 0.0,
+                            pnl_usd=float(pnl),
+                            notional_usd=float(notional),
+                            step2_row=s2_by.get(sym),
+                            validated_decision=validated_decision
+                            if isinstance(validated_decision, Mapping)
+                            else None,
+                            step2_packet=step2 if isinstance(step2, Mapping) else None,
+                            source_override_applied=src_ov_applied,
+                            relaxed_opening_env_snapshot=relaxed_opening_env_snapshot,
+                        )
+                    )
                     if math.isfinite(ret) and reason in (
                         "TAKE_PROFIT_HIT",
                         "STOP_LOSS_HIT",
@@ -1135,6 +1171,8 @@ def run_opening_replay_range(
         "csv_path": str(csv_path.resolve()),
         "use_ai_cache": use_ai_cache,
         "opening_reject_reason_counts": opening_reject_json,
+        "opening_surgical_pm_return_reject_total": opening_surgical_pm_reject_total,
+        "opening_surgical_expected_move_reject_total": opening_surgical_em_reject_total,
         "soft_band_candidate_count": soft_band_candidate_total,
         "soft_band_expected_move_pass_count": soft_band_expected_move_pass_total,
         "soft_band_accepted_count": soft_band_accepted_total,
@@ -1167,6 +1205,11 @@ def run_opening_replay_range(
         },
     }
     json_path = replay_out_dir / f"replay_summary_{start.isoformat()}_{end.isoformat()}.json"
+    attrib_path = replay_out_dir / f"replay_opening_attribution_{start.isoformat()}_{end.isoformat()}.json"
+    attrib_payload = analyze_opening_records(opening_attrib_records, starting_equity=float(starting_equity))
+    write_opening_attribution_json(attrib_path, attrib_payload)
+
+    summary["opening_attribution_report_path"] = str(attrib_path.resolve())
     json_path.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
     summary["json_path"] = str(json_path.resolve())
     return summary
@@ -1222,6 +1265,15 @@ def main() -> None:
     )
     print(json.dumps(summary, indent=2, default=str))
     _print_opening_diagnostic_summary(summary)
+    ap = summary.get("opening_attribution_report_path")
+    if ap:
+        try:
+            print_opening_attribution_summary(
+                json.loads(Path(ap).read_text(encoding="utf-8")),
+                max_symbol_rows=45,
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            _LOG.warning("opening attribution report read failed path=%s err=%s", ap, exc)
 
 
 if __name__ == "__main__":

@@ -192,6 +192,8 @@ class OpeningAllocationDiagnostics:
     soft_band_accepted_count: int = 0
     no_candidates_empty_count: int = 0
     decision_status_not_trade_count: int = 0
+    opening_surgical_pm_return_reject_count: int = 0
+    opening_surgical_expected_move_reject_count: int = 0
 
     def finalize_from_rejected(self, rejected: Sequence[Mapping[str, Any]]) -> None:
         """Fill ``opening_reject_reason_counts`` from the final rejected list (includes slot2/slot3)."""
@@ -236,6 +238,33 @@ def _premarket_expected_move_proxy(row: dict[str, Any] | None) -> float | None:
         total += abs(pm)
         got = True
     return total if got else None
+
+
+def _opening_surgical_candidate_reject_reason(row: dict[str, Any] | None) -> str | None:
+    """
+    Fixed-threshold opening-only prune (does not alter ranking/scoring).
+    Returns ``OPENING_REJECT_PM_RETURN_TOO_HIGH`` when pm_session_return_pct >= 2% (signed),
+    else ``OPENING_REJECT_EXPECTED_MOVE_TOO_HIGH`` when excursion proxy >= 3%
+    (``|gap|+|pm|``, same tape proxy used elsewhere in Step 4).
+    """
+    if row is None:
+        return None
+    pm = _as_float(row.get("pm_session_return_pct"))
+    if pm is not None and pm >= 0.02:
+        return "OPENING_REJECT_PM_RETURN_TOO_HIGH"
+    em = _premarket_expected_move_proxy(row)
+    if em is not None and em >= 0.03:
+        return "OPENING_REJECT_EXPECTED_MOVE_TOO_HIGH"
+    return None
+
+
+def _record_opening_surgical_reject_diag(diagnostics: OpeningAllocationDiagnostics | None, reason_code: str) -> None:
+    if diagnostics is None:
+        return
+    if reason_code == "OPENING_REJECT_PM_RETURN_TOO_HIGH":
+        diagnostics.opening_surgical_pm_return_reject_count += 1
+    elif reason_code == "OPENING_REJECT_EXPECTED_MOVE_TOO_HIGH":
+        diagnostics.opening_surgical_expected_move_reject_count += 1
 
 
 def _rank1_confidence_pass(
@@ -647,6 +676,23 @@ def accept_opening_candidates(
         row1 = None
     conf1 = _as_float(c1.get("confidence"))
 
+    surg1 = _opening_surgical_candidate_reject_reason(row1)
+    if surg1 is not None:
+        pmv = _as_float(row1.get("pm_session_return_pct")) if row1 is not None else None
+        emv = _premarket_expected_move_proxy(row1)
+        _LOG.info(
+            "OPENING_SURGICAL_REJECT rank=%d symbol=%s reason=%s pm_session_return_pct=%s expected_move_proxy=%s",
+            1,
+            sym1,
+            surg1,
+            pmv,
+            emv,
+        )
+        _record_opening_surgical_reject_diag(diagnostics, surg1)
+        _log_opening_reject(surg1, confidence=conf1, threshold=None, expected_move=emv)
+        rejected.append({"ai_rank": 1, "symbol": sym1, "reason_code": surg1, "detail": ""})
+        return accepted, rejected
+
     if diagnostics is not None and conf1 is not None:
         thr_s = float(config.c1_hard)
         soft_lo_s = max(float(config.c1_absolute_floor), thr_s - float(config.c1_soft_margin))
@@ -762,6 +808,32 @@ def accept_opening_candidates(
 
     gap_val = float(conf1) - float(conf2)
 
+    row2 = step2_by_symbol.get(sym2) if isinstance(step2_by_symbol, Mapping) else None
+    if not isinstance(row2, dict):
+        row2 = None
+    surg2 = _opening_surgical_candidate_reject_reason(row2)
+    if surg2 is not None:
+        pmv = _as_float(row2.get("pm_session_return_pct")) if row2 is not None else None
+        emv = _premarket_expected_move_proxy(row2)
+        _LOG.info(
+            "OPENING_SURGICAL_REJECT rank=%d symbol=%s reason=%s pm_session_return_pct=%s expected_move_proxy=%s",
+            2,
+            sym2,
+            surg2,
+            pmv,
+            emv,
+        )
+        _record_opening_surgical_reject_diag(diagnostics, surg2)
+        _log_opening_reject(
+            surg2,
+            confidence=conf2,
+            threshold=None,
+            expected_move=_premarket_expected_move_proxy(row2),
+        )
+        rejected.append({"ai_rank": 2, "symbol": sym2, "reason_code": surg2, "detail": ""})
+        _reject_rank3_cascade(cands, rejected)
+        return accepted, rejected
+
     if conf2 < config.c2:
         _log_slot2_reject(
             "SLOT2_REJECT_BELOW_C2",
@@ -825,9 +897,6 @@ def accept_opening_candidates(
         _reject_rank3_cascade(cands, rejected)
         return accepted, rejected
 
-    row2 = step2_by_symbol.get(sym2) if isinstance(step2_by_symbol, Mapping) else None
-    if not isinstance(row2, dict):
-        row2 = None
     vol2, vfail2 = _step2_volume_for_rank(row2, config, 2)
     if vol2 is None:
         _log_slot2_reject(
@@ -912,6 +981,28 @@ def accept_opening_candidates(
     vol3, vfail3 = _step2_volume_for_rank(row3, config, 3)
     if vol3 is None:
         rejected.append({"ai_rank": 3, "symbol": sym3, "reason_code": vfail3, "detail": ""})
+        return accepted, rejected
+
+    surg3 = _opening_surgical_candidate_reject_reason(row3)
+    if surg3 is not None:
+        pmv = _as_float(row3.get("pm_session_return_pct"))
+        emv = _premarket_expected_move_proxy(row3)
+        _LOG.info(
+            "OPENING_SURGICAL_REJECT rank=%d symbol=%s reason=%s pm_session_return_pct=%s expected_move_proxy=%s",
+            3,
+            sym3,
+            surg3,
+            pmv,
+            emv,
+        )
+        _record_opening_surgical_reject_diag(diagnostics, surg3)
+        _log_opening_reject(
+            surg3,
+            confidence=float(conf3),
+            threshold=None,
+            expected_move=_premarket_expected_move_proxy(row3),
+        )
+        rejected.append({"ai_rank": 3, "symbol": sym3, "reason_code": surg3, "detail": ""})
         return accepted, rejected
 
     accepted.append(
@@ -1002,4 +1093,10 @@ def prepare_opening_execution(
         diag.finalize_from_rejected(rejected)
         diag.slot1_full_sleeve_only = n == 1 and preparation_status == "ready"
         out["allocation_diagnostics"] = diag.to_json_dict()
+        _LOG.info(
+            "OPENING_SURGICAL_FILTER_DAY_TOTALS trade_date=%s pm_return_rejects=%d expected_move_rejects=%d",
+            trade_date,
+            diag.opening_surgical_pm_return_reject_count,
+            diag.opening_surgical_expected_move_reject_count,
+        )
     return out
