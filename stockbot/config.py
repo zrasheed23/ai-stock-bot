@@ -17,6 +17,7 @@ ENABLE_PREMARKET_SIGNALS = True
 
 # Optional conservative behavior toggles (opening / mid-morning only; default off).
 # STOCKBOT_SLOT2_RELAX_OPENING=1 — slightly easier slot-2 acceptance + smaller slot-2 weight when borderline.
+# STOCKBOT_SLOT2_ELITE_ONLY_OPENING=1 — optional: keep slot-2 capital only when extra elite gates pass; caps slot-2 weight (opening_two_leg only).
 # STOCKBOT_MIDMORNING_RELAX_FILTERS=1 — small tape-threshold deltas for sector-RS mid-morning path.
 
 PM_GAP_ATR_HARD_SKIP = 2.5

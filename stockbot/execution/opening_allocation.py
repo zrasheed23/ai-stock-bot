@@ -125,6 +125,15 @@ class OpeningAllocationConfig:
     mm_spy_min_signed_alignment_pct: float = 0.0
     # Set True when ``opening_allocation_config_from_env()`` sees STOCKBOT_SLOT2_RELAX_OPENING (conservative slot2).
     slot2_relaxed_opening: bool = False
+    # Optional: opening_two_leg only — extra gates + small slot-2 weight cap (env STOCKBOT_SLOT2_ELITE_ONLY_OPENING).
+    slot2_elite_only_opening: bool = False
+    slot2_elite_min_confidence: float = 0.718
+    slot2_elite_max_confidence_gap: float = 0.028
+    slot2_elite_min_pm_volume_multiplier: float = 1.3
+    slot2_elite_max_expected_move_gap: float = 0.008
+    slot2_elite_overlap_max_gap: float = 0.026
+    slot2_elite_overlap_min_confidence: float = 0.725
+    slot2_elite_max_slot2_weight: float = 0.12
 
 
 # Stricter Step 4 profile for ~10:30 ET session only (does not alter opening defaults above).
@@ -153,18 +162,20 @@ MIDMORNING_ALLOCATION_CONFIG = OpeningAllocationConfig(
 
 
 def opening_allocation_config_from_env() -> OpeningAllocationConfig:
-    """Opening Step 4 config; optional conservative slot2 relaxation via ``STOCKBOT_SLOT2_RELAX_OPENING``."""
+    """Opening Step 4 config; optional slot2 flags via env (relax / elite-only weight path)."""
     import os
 
-    base = OpeningAllocationConfig()
-    if os.environ.get("STOCKBOT_SLOT2_RELAX_OPENING", "").strip().lower() not in {"1", "true", "yes", "on"}:
-        return base
-    return replace(
-        base,
-        slot2_relaxed_opening=True,
-        slot2_min_expected_move=min(0.0105, base.slot2_min_expected_move),
-        slot2_max_gap_vs_rank1=min(0.054, base.slot2_max_gap_vs_rank1 + 0.006),
-    )
+    cfg = OpeningAllocationConfig()
+    if os.environ.get("STOCKBOT_SLOT2_RELAX_OPENING", "").strip().lower() in {"1", "true", "yes", "on"}:
+        cfg = replace(
+            cfg,
+            slot2_relaxed_opening=True,
+            slot2_min_expected_move=min(0.0105, cfg.slot2_min_expected_move),
+            slot2_max_gap_vs_rank1=min(0.054, cfg.slot2_max_gap_vs_rank1 + 0.006),
+        )
+    if os.environ.get("STOCKBOT_SLOT2_ELITE_ONLY_OPENING", "").strip().lower() in {"1", "true", "yes", "on"}:
+        cfg = replace(cfg, slot2_elite_only_opening=True)
+    return cfg
 
 
 @dataclass
@@ -380,6 +391,37 @@ _OPENING_SLOT2_MIN_CONF_KEEP = 0.685
 _OPENING_SLOT2_GAP_SKIP = 0.068
 
 
+def _slot2_elite_only_gate_failure(
+    *,
+    c2: float,
+    gap: float,
+    row2: dict[str, Any] | None,
+    em1: float | None,
+    em2: float | None,
+    overlap: bool,
+    config: OpeningAllocationConfig,
+) -> str | None:
+    """Elite-only opening slot-2 gate (``slot2_elite_only_opening``). None means pass."""
+    if row2 is None or row2.get("status") != "ok":
+        return "STEP2_STATUS_NOT_OK"
+    pmv = _as_float(row2.get("pm_volume"))
+    need_vol = float(config.min_pm_volume) * float(config.slot2_elite_min_pm_volume_multiplier)
+    if pmv is None or pmv < need_vol:
+        return "PM_VOLUME_BELOW_ELITE_MULT"
+    if c2 < float(config.slot2_elite_min_confidence):
+        return "CONFIDENCE_BELOW_ELITE_FLOOR"
+    if gap > float(config.slot2_elite_max_confidence_gap):
+        return "CONFIDENCE_GAP_TOO_WIDE"
+    if em1 is None or em2 is None:
+        return "EXPECTED_MOVE_PROXY_MISSING"
+    if em2 < em1 - float(config.slot2_elite_max_expected_move_gap):
+        return "EXPECTED_MOVE_TOO_WEAK_VS_RANK1"
+    if overlap:
+        if gap > float(config.slot2_elite_overlap_max_gap) or c2 < float(config.slot2_elite_overlap_min_confidence):
+            return "OVERLAP_NOT_ELITE_PEER"
+    return None
+
+
 def opening_two_leg_capital_weights(
     accepted: list[dict[str, Any]],
     rejected: list[dict[str, Any]],
@@ -496,6 +538,57 @@ def opening_two_leg_capital_weights(
     else:
         w1, w2 = 0.85, 0.15
         reason = "moderate_gap_slot2_weight_15"
+
+    if config.slot2_elite_only_opening:
+        row1_elite = step2_by_symbol.get(sym1) if isinstance(step2_by_symbol, Mapping) else None
+        if not isinstance(row1_elite, dict):
+            row1_elite = None
+        em1 = _premarket_expected_move_proxy(row1_elite)
+        em_gap_str = (
+            "na" if em1 is None or em2 is None else f"{float(em1) - float(em2):.6f}"
+        )
+        elite_fail = _slot2_elite_only_gate_failure(
+            c2=c2,
+            gap=gap,
+            row2=row2,
+            em1=em1,
+            em2=em2,
+            overlap=overlap,
+            config=config,
+        )
+        if elite_fail:
+            _LOG.info(
+                "SLOT2_ELITE_REJECT_REASON=%s rank1_score=%.6f rank2_score=%.6f score_gap=%.6f "
+                "expected_move_gap=%s final_slot2_weight=0.0000",
+                elite_fail,
+                c1,
+                c2,
+                gap,
+                em_gap_str,
+            )
+            rej_out.append(
+                {
+                    "ai_rank": 2,
+                    "symbol": sym2,
+                    "reason_code": "SLOT2_SKIP_ELITE_ONLY_OPENING",
+                    "detail": elite_fail,
+                }
+            )
+            return [1.0], [a1], rej_out
+        cap_w2 = float(config.slot2_elite_max_slot2_weight)
+        if w2 > cap_w2:
+            w2 = cap_w2
+            w1 = 1.0 - w2
+            reason = f"{reason}_elite_w2_cap"
+        _LOG.info(
+            "SLOT2_ELITE_ACCEPT rank1_score=%.6f rank2_score=%.6f score_gap=%.6f expected_move_gap=%s "
+            "final_slot2_weight=%.4f",
+            c1,
+            c2,
+            gap,
+            em_gap_str,
+            w2,
+        )
 
     _log_weight(w2, reason)
     return [w1, w2], accepted, rej_out
